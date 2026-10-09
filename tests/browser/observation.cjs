@@ -17,6 +17,23 @@ function hasAcceptedHandshake(observation) {
     message.sourceName === 'worker' && message.targetName === 'main');
 }
 
+async function waitForConversionOutcome(readState, timeoutMs = 45000, intervalMs = 50) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = await withDeadline(readState(), 'Conversion outcome observation',
+      Math.min(3000, Math.max(1, deadline - Date.now())));
+    if (state.downloadCount > 0) return { kind: 'download', state };
+    if (state.success) return { kind: 'success', state };
+    if (state.error) return { kind: 'error', state };
+    await new Promise(resolve => setTimeout(resolve, Math.min(intervalMs, Math.max(1, deadline - Date.now()))));
+  }
+  throw new Error(`Conversion produced no error, success or download within ${timeoutMs}ms`);
+}
+
+function normalizeWorkerUrl(rawUrl, pageUrl) {
+  return { rawUrl, url: new URL(rawUrl, pageUrl).href };
+}
+
 function selectAttemptWorker(workers, startIndex, url) {
   const matches = workers.slice(startIndex).filter(worker => worker.url === url);
   if (matches.length !== 1) throw new Error(`Expected one worker from this attempt, observed ${matches.length}`);
@@ -42,4 +59,4 @@ async function observeAcceptedWorker(worker, observation, timeoutMs = OBSERVATIO
   }
 }
 
-module.exports = { withDeadline, hasAcceptedHandshake, selectAttemptWorker, observeAcceptedWorker };
+module.exports = { waitForConversionOutcome, normalizeWorkerUrl, withDeadline, hasAcceptedHandshake, selectAttemptWorker, observeAcceptedWorker };

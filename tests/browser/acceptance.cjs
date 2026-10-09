@@ -6,7 +6,9 @@ const { createHash } = require('node:crypto');
 const { createRequire } = require('node:module');
 const { execFileSync, spawn } = require('node:child_process');
 const playwright = require('playwright');
-const { withDeadline, hasAcceptedHandshake, selectAttemptWorker, observeAcceptedWorker } = require('./observation.cjs');
+const { waitForConversionOutcome, normalizeWorkerUrl, withDeadline, hasAcceptedHandshake, selectAttemptWorker, observeAcceptedWorker } = require('./observation.cjs');
+
+const { createCanvasBoundary } = require('./canvas-boundary.cjs');
 
 const root = path.resolve(__dirname, '../..');
 const requireApp = createRequire(path.join(root, 'package.json'));
@@ -30,11 +32,18 @@ const mime = filename => ({ '.html': 'text/html', '.js': 'application/javascript
   '.svg': 'image/svg+xml', '.json': 'application/json', '.txt': 'text/plain' }[path.extname(filename)] || 'application/octet-stream');
 
 // Observe native browser boundaries. Arguments and return values remain untouched
-// except for the explicitly armed page-2 fault. keepNames is the production config,
-// not a testing-only build override. Record the immediate caller on every page.
-function observeBrowser() {
+// except for the explicitly armed page-2 fault. The fixture canvas protocol
+// establishes identity/order independently of stack names or production minification.
+function observeBrowser(createBoundary) {
   const evidence = window.__pdfAcceptance = { fault: null, canvases: 0, exports: [],
-    faults: [], contextCalls: [], exportCalls: 0, workersConstructed: [], fixture: null, attempt: 0 };
+    faults: [], contextCalls: [], exportCalls: 0, workersConstructed: [], fixture: null, attempt: 0, unmatched: [], protocolViolations: [] };
+  const boundary = createBoundary(evidence);
+  const nativeCreateElement = Document.prototype.createElement;
+  Document.prototype.createElement = function (...args) {
+    const element = nativeCreateElement.apply(this, args);
+    if (element instanceof HTMLCanvasElement) boundary.register(element);
+    return element;
+  };
   const NativeWorker = window.Worker;
   window.Worker = new Proxy(NativeWorker, {
     construct(target, args, newTarget) {
@@ -57,28 +66,19 @@ function observeBrowser() {
   const nativeContext = HTMLCanvasElement.prototype.getContext;
   const nativeExport = HTMLCanvasElement.prototype.toDataURL;
   HTMLCanvasElement.prototype.getContext = function observedGetContext(...args) {
-    const frames = (new Error().stack || '').split('\n');
-    const index = frames.findIndex(frame => frame.includes('observedGetContext'));
-    const caller = index >= 0 ? frames[index + 1] || '' : '';
-    // Chromium prefixes stacks with Error; Firefox/WebKit do not. Find our
-    // named wrapper, then only its immediate caller, never any ancestor.
-    if (args[0] === '2d' && caller.includes('convertPdfToWord') && !this.__pdfSourcePage) {
-      this.__pdfSourcePage = ++evidence.canvases;
-      evidence.contextCalls.push({ page: this.__pdfSourcePage, invocation: evidence.canvases, caller });
-      if (this.__pdfSourcePage === 2 && evidence.fault === 'null-context') {
-        evidence.faults.push({ page: 2, fault: evidence.fault, invocation: evidence.canvases, boundary: 'getContext' });
-        return null;
-      }
+    const observed = boundary.context(this, args, new Error().stack);
+    if (observed?.page === 2 && evidence.fault === 'null-context') {
+      evidence.faults.push({ page: 2, fault: evidence.fault, invocation: observed.invocation,
+        canvasId: observed.canvasId, boundary: 'getContext' });
+      return null;
     }
     return nativeContext.apply(this, args);
   };
   HTMLCanvasElement.prototype.toDataURL = function observedToDataURL(...args) {
+    const observed = boundary.export(this, args, new Error().stack);
     const actual = nativeExport.apply(this, args);
-    if (!this.__pdfSourcePage) return actual;
-    const frames = (new Error().stack || '').split('\n');
-    const index = frames.findIndex(frame => frame.includes('observedToDataURL'));
-    const caller = index >= 0 ? frames[index + 1] || '' : '';
-    const page = this.__pdfSourcePage;
+    if (!observed) return actual;
+    const { page, invocation, canvasId } = observed;
     const control = evidence.fixture.pages[page - 1];
     const context = nativeContext.call(this, '2d');
     const scaleX = this.width / control.widthPt, scaleY = this.height / control.heightPt;
@@ -94,10 +94,9 @@ function observeBrowser() {
       }
       return { name: region.name, whiteFraction: white / (pixels.length / 4) };
     });
-    const invocation = ++evidence.exportCalls;
-    evidence.exports.push({ page, invocation, caller, width: this.width, height: this.height, samples, regions, actual });
+    evidence.exports.push({ ...observed, width: this.width, height: this.height, samples, regions, actual });
     if (page === 2 && evidence.fault) {
-      evidence.faults.push({ page: 2, fault: evidence.fault, invocation, boundary: 'toDataURL' });
+      evidence.faults.push({ page: 2, fault: evidence.fault, invocation, canvasId, boundary: 'toDataURL' });
       if (evidence.fault === 'empty-image') return 'data:,';
       if (evidence.fault === 'malformed-base64') return 'data:image/jpeg;base64,%';
       if (evidence.fault === 'image-encoding') throw new Error('Controlled page 2 image encoding failure');
@@ -121,8 +120,9 @@ async function recordState(page, directory) {
   }
   const body = await page.locator('body').innerText();
   await fs.writeFile(path.join(directory, 'page.txt'), body);
-  await page.screenshot({ path: path.join(directory, 'conversion.png'), fullPage: true });
   await writeJson(path.join(directory, 'canvas.json'), state);
+  await withDeadline(page.screenshot({ path: path.join(directory, 'conversion.png'), fullPage: true, timeout: 5000 }),
+    'Conversion evidence screenshot', 6000);
   return { state, images, body };
 }
 
@@ -183,7 +183,7 @@ async function assertDocument(bytes, recorded, fixture, directory, checkPixels =
 async function arm(page, fixture, fault = null) {
   await page.evaluate(({ control, nextFault }) => {
     Object.assign(window.__pdfAcceptance, { fault: nextFault, fixture: control, attempt: window.__pdfAcceptance.attempt + 1, canvases: 0,
-      exports: [], faults: [], contextCalls: [], exportCalls: 0 });
+      exports: [], faults: [], contextCalls: [], exportCalls: 0, unmatched: [], protocolViolations: [] });
   }, { control: fixture, nextFault: fault });
 }
 
@@ -205,8 +205,9 @@ async function saveDownload(page, download, fixture, directory, checkPixels = tr
   assert.equal(recorded.state.canvases, fixture.pageCount, 'observed every app page despite production minification');
   assert.deepEqual(recorded.state.contextCalls.map(call => call.invocation), fixture.pages.map((_, index) => index + 1));
   assert.equal(recorded.state.exportCalls, fixture.pageCount);
-  assert.ok(recorded.state.contextCalls.every(call => call.caller.includes('convertPdfToWord')));
-  assert.ok(recorded.state.exports.every(call => call.caller.includes('convertPdfToWord')));
+  assert.deepEqual(recorded.state.protocolViolations, [], 'strict source-canvas lifecycle');
+  assert.deepEqual(recorded.state.exports.map(call => call.canvasId), recorded.state.contextCalls.map(call => call.canvasId), 'each page exports its exact source canvas');
+  assert.ok(recorded.state.contextCalls.every(call => call.createdAttempt === recorded.state.attempt), 'source canvases belong to this attempt');
   assert.deepEqual(recorded.state.faults, []);
   assert.ok(!recorded.body.includes('Lỗi khi chuyển đổi:'));
   return assertDocument(await fs.readFile(target), recorded, fixture, directory, checkPixels);
@@ -223,16 +224,45 @@ async function completeConversion(page, fixture, directory, downloads) {
   return report;
 }
 
+async function conversionOutcome(page, downloads) {
+  return waitForConversionOutcome(async () => {
+    if (downloads.length) return { downloadCount: downloads.length };
+    const state = await page.evaluate(text => ({ success: document.body.innerText.includes(text),
+      error: document.querySelector('[role=alert]')?.textContent || '' }), successText);
+    return { ...state, downloadCount: downloads.length };
+  });
+}
+
+async function preserveUnexpectedDownloads(downloads, directory, startIndex = 0) {
+  await fs.mkdir(directory, { recursive: true });
+  const snapshot = downloads.slice(startIndex);
+  for (const [offset, download] of snapshot.entries()) {
+    const index = startIndex + offset;
+    await withDeadline(download.saveAs(path.join(directory, `${index + 1}-${path.basename(download.suggestedFilename())}`)),
+      'Unexpected negative-case download');
+  }
+  return startIndex + snapshot.length;
+}
+
 async function captureFailure(page, directory, downloads, sourcePage = null) {
-  const alert = page.getByRole('alert');
-  await alert.waitFor({ state: 'visible', timeout: 45000 });
-  assert.match(await alert.innerText(), sourcePage ? new RegExp(`^Lỗi khi chuyển đổi: Không thể chuyển đổi trang ${sourcePage}:`) : /^Lỗi khi chuyển đổi:/);
-  await waitUntilIdle(page);
-  // FileSaver queues its click; settle that task before claiming no download.
+  const outcome = await conversionOutcome(page, downloads);
+  if (outcome.kind === 'error') await waitUntilIdle(page);
+  // FileSaver queues its click. If success already appeared, briefly await the
+  // real download so the rejected negative case still retains its DOCX evidence.
+  if (outcome.kind === 'success' && downloads.length === 0) {
+    await page.waitForEvent('download', { timeout: 1500 }).catch(() => {});
+  }
   await page.waitForTimeout(250);
+  const savedCount = downloads.length
+    ? await preserveUnexpectedDownloads(downloads, path.join(directory, 'unexpected-downloads')) : 0;
   const recorded = await recordState(page, directory);
-  assert.equal(downloads.length, 0, 'failure must never download a partial DOCX');
-  assert.ok(!recorded.body.includes(successText), 'failure must never claim success');
+  if (downloads.length || recorded.body.includes(successText) || outcome.kind !== 'error') {
+    await preserveUnexpectedDownloads(downloads, path.join(directory, 'unexpected-downloads'), savedCount);
+    throw new Error(`Expected conversion failure, observed ${downloads.length ? 'download' : outcome.kind}; canvas and DOCX evidence retained`);
+  }
+  assert.deepEqual(recorded.state.protocolViolations, [], 'negative phase has no canvas protocol violations');
+  const alert = page.getByRole('alert');
+  assert.match(await alert.innerText(), sourcePage ? new RegExp(`^Lỗi khi chuyển đổi: Không thể chuyển đổi trang ${sourcePage}:`) : /^Lỗi khi chuyển đổi:/);
   assert.ok(!recorded.body.includes('100%'), 'failure must never display 100%');
   return recorded;
 }
@@ -373,12 +403,12 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
       } catch (error) { evidence.error = String(error); }
     })());
   });
-  await context.addInitScript(observeBrowser);
+  await context.addInitScript({ content: `(${observeBrowser.toString()})(${createCanvasBoundary.toString()});` });
   const page = await context.newPage();
   page.on('pageerror', error => errors.push(String(error)));
   page.on('console', message => logs.push({ type: message.type(), text: message.text() }));
   page.on('worker', worker => {
-    const evidence = { id: workers.length, url: worker.url(), closed: false,
+    const evidence = { id: workers.length, ...normalizeWorkerUrl(worker.url(), page.url()), closed: false,
       observation: { status: 'not-requested', reason: 'No accepted native PDF.js handshake' } };
     workers.push(evidence);
     workerHandles.set(evidence.id, worker);
@@ -393,6 +423,7 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
     await writeJson(path.join(directory, 'phase.json'), { ...result, lastPhase: entry });
   };
   const accept = async label => {
+    await phase(label);
     const logStart = logs.length, workerStart = workers.length;
     const report = await completeConversion(page, fixture, path.join(directory, label), downloads);
     const worker = await verifyWorkerAttempt(page, deployment, workers, workerHandles, logs, logStart, workerStart);
@@ -421,7 +452,7 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
       const restoreLogStart = logs.length, restoreWorkerStart = workers.length;
       await phase('resource-restored-same-page-probe');
       await page.getByRole('button', { name: buttonName, exact: true }).click();
-      await page.waitForFunction(text => document.querySelector('[role=alert]') || document.body.innerText.includes(text), successText, { timeout: 45000 });
+      await conversionOutcome(page, downloads);
       await waitUntilIdle(page);
       await page.waitForTimeout(250);
       if (await page.getByRole('alert').isVisible()) {
@@ -451,14 +482,18 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
       result.recoveryBoundary = 'page reload and reselect the identical fixture';
     } else if (scenario.fault) {
       const logStart = logs.length, workerStart = workers.length;
+      await phase(`expect-page-2-${scenario.fault}`);
       await page.getByRole('button', { name: buttonName, exact: true }).click();
       const failed = await captureFailure(page, path.join(directory, 'failure'), downloads, 2);
       assert.equal(failed.state.canvases, 2, 'abort before processing page 3');
       assert.deepEqual(failed.state.contextCalls.map(call => call.invocation), [1, 2], 'exact source-page context invocation');
-      assert.ok(failed.state.contextCalls.every(call => call.caller.includes('convertPdfToWord')), 'immediate app caller observed even after minification');
+      assert.deepEqual(failed.state.protocolViolations, [], 'strict source-canvas lifecycle even on failure');
+      assert.ok(failed.state.contextCalls.every(call => call.createdAttempt === failed.state.attempt));
       assert.equal(failed.state.exportCalls, scenario.fault === 'null-context' ? 1 : 2, 'exact source-page export invocation');
-      assert.ok(failed.state.exports.every(call => call.caller.includes('convertPdfToWord')));
-      assert.deepEqual(failed.state.faults, [{ page: 2, fault: scenario.fault, invocation: 2,
+      assert.deepEqual(failed.state.exports.map(call => call.canvasId), failed.state.contextCalls.slice(0, failed.state.exports.length).map(call => call.canvasId), 'fault exports retain exact source-canvas identities');
+      if (scenario.fault === 'null-context') assert.equal(await page.getByRole('alert').innerText(),
+        'Lỗi khi chuyển đổi: Không thể chuyển đổi trang 2: Không thể tạo vùng vẽ cho trang PDF.', 'the null context is caught by the app source-canvas guard');
+      assert.deepEqual(failed.state.faults, [{ page: 2, fault: scenario.fault, invocation: 2, canvasId: failed.state.contextCalls[1].canvasId,
         boundary: scenario.fault === 'null-context' ? 'getContext' : 'toDataURL' }], 'one fault on source page 2');
       result.failure = { downloads: 0, success: false, page: 2, fault: scenario.fault, invocation: 2,
         worker: await verifyWorkerAttempt(page, deployment, workers, workerHandles, logs, logStart, workerStart) };
@@ -477,6 +512,9 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
     result.status = 'passed';
   } catch (error) {
     result.status = 'failed'; result.error = error.stack;
+    const detail = `${error.name}: ${error.message}`.replace(/\s+/g, ' ').slice(0, 350);
+    result.failureMessage = detail;
+    console.error(`failed: ${deployment.name}/${engine}/${scenario.name} phase=${result.phases.at(-1)?.name || 'initialization'} ${detail}`);
     await withDeadline(page.screenshot({ path: path.join(directory, 'failure-diagnostic.png'),
       fullPage: true, timeout: 5000 }), 'Failure diagnostic screenshot', 6000)
       .catch(error => { result.diagnosticScreenshotError = String(error); });
@@ -503,6 +541,10 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
     // deadlines keep this diagnostic drain bounded even if the browser does not.
     try { await withDeadline(Promise.all(pending), 'Supplemental response cleanup', 11000); }
     catch (error) { result.observerCleanupError = String(error); result.status = 'failed'; }
+    if (result.status === 'failed' && !result.failureMessage) {
+      result.failureMessage = String(result.cleanup?.error || result.observerCleanupError || result.error).replace(/\s+/g, ' ').slice(0, 350);
+      console.error(`failed: ${deployment.name}/${engine}/${scenario.name} phase=${result.phases.at(-1)?.name || 'cleanup'} ${result.failureMessage}`);
+    }
     await persist();
     workerHandles.clear();
   }
