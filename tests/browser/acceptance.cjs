@@ -6,6 +6,7 @@ const { createHash } = require('node:crypto');
 const { createRequire } = require('node:module');
 const { execFileSync, spawn } = require('node:child_process');
 const playwright = require('playwright');
+const { withDeadline, hasAcceptedHandshake, selectAttemptWorker, observeAcceptedWorker } = require('./observation.cjs');
 
 const root = path.resolve(__dirname, '../..');
 const requireApp = createRequire(path.join(root, 'package.json'));
@@ -315,8 +316,7 @@ function assertResourceResponses(result, deployment, serverEntries) {
   result.verifiedResources = [...new Set(served.map(item => item.packagePath))];
 }
 
-async function verifyWorkerAttempt(page, deployment, workers, pending, logs, logStart) {
-  await Promise.all(pending);
+async function verifyWorkerAttempt(page, deployment, workers, workerHandles, logs, logStart, workerStart) {
   const state = await page.evaluate(() => window.__pdfAcceptance);
   const constructors = state.workersConstructed.filter(worker => worker.attempt === state.attempt);
   assert.equal(constructors.length, 1, 'each conversion constructs its own native worker');
@@ -326,10 +326,12 @@ async function verifyWorkerAttempt(page, deployment, workers, pending, logs, log
   assert.ok(new URL(observed.url).pathname.startsWith(deployment.base), 'worker preserves deployment base');
   if (deployment.mode === 'production') assert.equal(observed.url, deployment.assets[0].url);
   assert.deepEqual(observed.errors, [], 'no native worker errors on accepted conversions');
-  assert.ok(observed.messages.some(message => message.action === 'test' && message.data === true &&
-    message.sourceName === 'worker' && message.targetName === 'main'), 'real PDF.js worker passed its native transfer handshake');
-  const execution = workers.filter(worker => worker.url === observed.url).at(-1);
+  assert.ok(hasAcceptedHandshake(observed), 'real PDF.js worker passed its native transfer handshake');
+  const execution = selectAttemptWorker(workers, workerStart, observed.url);
   assert.ok(execution, 'native constructor produced a Playwright dedicated-worker event');
+  execution.observation = await observeAcceptedWorker(workerHandles.get(execution.id), observed);
+  assert.equal(execution.observation.status, 'fulfilled', `accepted worker observation: ${JSON.stringify(execution.observation)}`);
+  execution.scope = execution.observation.scope;
   assert.equal(execution.scope?.dedicated, true, 'executed inside DedicatedWorkerGlobalScope');
   assert.equal(execution.scope?.documentType, 'undefined', 'worker execution is outside the document');
   assert.equal(execution.scope?.origin, origin);
@@ -342,6 +344,7 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
   await fs.mkdir(directory, { recursive: true });
   const context = await browser.newContext({ acceptDownloads: true, serviceWorkers: 'block', viewport: { width: 1150, height: 950 } });
   const network = [], errors = [], logs = [], workers = [], downloads = [], responses = [], pending = [];
+  const workerHandles = new Map();
   const ledgerStart = deployment.server?.ledger.length || 0;
   await context.route('**/*', route => {
     const request = route.request(), url = request.url();
@@ -362,7 +365,7 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
       responses.push(evidence);
       try {
         let bytes;
-        try { bytes = await response.body(); }
+        try { bytes = await withDeadline(response.body(), 'Browser response body'); }
         catch (error) { evidence.captureUnavailable = String(error); return; }
         evidence.bytes = bytes.length; evidence.sha256 = sha256(bytes);
         assert.equal(evidence.sha256, asset.sha256, 'browser-observed worker response bytes');
@@ -375,19 +378,24 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
   page.on('pageerror', error => errors.push(String(error)));
   page.on('console', message => logs.push({ type: message.type(), text: message.text() }));
   page.on('worker', worker => {
-    const evidence = { url: worker.url() };
+    const evidence = { id: workers.length, url: worker.url(), closed: false,
+      observation: { status: 'not-requested', reason: 'No accepted native PDF.js handshake' } };
     workers.push(evidence);
-    pending.push(worker.evaluate(() => ({
-      dedicated: typeof DedicatedWorkerGlobalScope !== 'undefined' && self instanceof DedicatedWorkerGlobalScope,
-      documentType: typeof document, origin: location.origin,
-    })).then(scope => { evidence.scope = scope; }, error => { evidence.error = String(error); }));
+    workerHandles.set(evidence.id, worker);
+    worker.on('close', () => { evidence.closed = true; });
   });
   page.on('download', download => downloads.push(download));
-  const result = { name: scenario.name, fixture: fixture.file, engine, buildBase: deployment.base, mode: deployment.mode, status: 'running', acceptedWorkers: [] };
+  const result = { name: scenario.name, fixture: fixture.file, engine, buildBase: deployment.base, mode: deployment.mode, status: 'running', acceptedWorkers: [], phases: [] };
+  const phase = async name => {
+    const entry = { name, at: new Date().toISOString() };
+    result.phases.push(entry);
+    console.log(`phase: ${deployment.name}/${engine}/${scenario.name}/${name}`);
+    await writeJson(path.join(directory, 'phase.json'), { ...result, lastPhase: entry });
+  };
   const accept = async label => {
-    const logStart = logs.length;
+    const logStart = logs.length, workerStart = workers.length;
     const report = await completeConversion(page, fixture, path.join(directory, label), downloads);
-    const worker = await verifyWorkerAttempt(page, deployment, workers, pending, logs, logStart);
+    const worker = await verifyWorkerAttempt(page, deployment, workers, workerHandles, logs, logStart, workerStart);
     result.acceptedWorkers.push({ phase: label, ...worker });
     return report;
   };
@@ -398,17 +406,20 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
     if (scenario.missingWorker) {
       const workerPath = new URL(deployment.assets[0].url).pathname;
       deployment.server.missing.add(workerPath);
+      await phase('missing-worker-request');
       await page.getByRole('button', { name: buttonName, exact: true }).click();
       const failed = await captureFailure(page, path.join(directory, 'missing-worker'), downloads);
       assert.equal(failed.state.canvases, 0, 'missing worker fails before rendering source pages');
       assert.ok(deployment.server.ledger.slice(ledgerStart).some(entry =>
         new URL(entry.url).pathname === workerPath && entry.status === 404), 'worker was genuinely unavailable at the origin');
       result.failure = { missingWorker: workerPath, downloads: 0, success: false };
+      await phase('missing-worker-failure-recorded');
       // PDF.js 3.11 can latch both worker-disabled state and a rejected fallback
       // promise. Observe restoration on the same page before recovering by reload.
       deployment.server.missing.delete(workerPath);
       await arm(page, fixture);
-      const restoreLogStart = logs.length;
+      const restoreLogStart = logs.length, restoreWorkerStart = workers.length;
+      await phase('resource-restored-same-page-probe');
       await page.getByRole('button', { name: buttonName, exact: true }).click();
       await page.waitForFunction(text => document.querySelector('[role=alert]') || document.body.innerText.includes(text), successText, { timeout: 45000 });
       await waitUntilIdle(page);
@@ -420,22 +431,26 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
         assert.equal(downloads.length, 1, 'same-page restoration produced exactly one download');
         const document = await saveDownload(page, downloads[0], fixture, path.join(directory, 'restored-same-page'));
         try {
-          const worker = await verifyWorkerAttempt(page, deployment, workers, pending, logs, restoreLogStart);
+          const worker = await verifyWorkerAttempt(page, deployment, workers, workerHandles, logs, restoreLogStart, restoreWorkerStart);
           result.samePageRestoration = { outcome: 'dedicated-worker-recovery', reloadRequired: false, document, worker };
         } catch (error) {
           result.samePageRestoration = { outcome: 'download-without-dedicated-worker-proof', reloadRequired: true, document, workerError: String(error) };
         }
       }
+      await phase('same-page-restoration-recorded');
       // A fresh document is an explicit recovery boundary, never an in-place retry claim.
       const recoveryErrorStart = errors.length;
+      await phase('reload-recovery-start');
       await page.reload({ waitUntil: 'networkidle' });
       await page.locator('input[type=file]').setInputFiles(path.join(fixtureDirectory, fixture.file));
       await arm(page, fixture);
+      await phase('reload-recovery-conversion');
       result.reloadRecovery = await accept('restored-after-reload');
+      await phase('reload-recovery-verified');
       assert.deepEqual(errors.slice(recoveryErrorStart), [], 'no uncaught errors after reload recovery');
       result.recoveryBoundary = 'page reload and reselect the identical fixture';
     } else if (scenario.fault) {
-      const logStart = logs.length;
+      const logStart = logs.length, workerStart = workers.length;
       await page.getByRole('button', { name: buttonName, exact: true }).click();
       const failed = await captureFailure(page, path.join(directory, 'failure'), downloads, 2);
       assert.equal(failed.state.canvases, 2, 'abort before processing page 3');
@@ -446,7 +461,7 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
       assert.deepEqual(failed.state.faults, [{ page: 2, fault: scenario.fault, invocation: 2,
         boundary: scenario.fault === 'null-context' ? 'getContext' : 'toDataURL' }], 'one fault on source page 2');
       result.failure = { downloads: 0, success: false, page: 2, fault: scenario.fault, invocation: 2,
-        worker: await verifyWorkerAttempt(page, deployment, workers, pending, logs, logStart) };
+        worker: await verifyWorkerAttempt(page, deployment, workers, workerHandles, logs, logStart, workerStart) };
       await arm(page, fixture);
       result.retry = await accept('retry-same-page-same-file');
     } else {
@@ -454,7 +469,7 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
       await arm(page, fixture);
       result.repeat = await accept('repeat-same-page-same-file');
     }
-    await Promise.all(pending);
+    await withDeadline(Promise.all(pending), 'Supplemental response observations', 11000);
     if (!scenario.missingWorker) assert.deepEqual(errors, [], 'no uncaught browser errors');
     assert.ok(!network.some(request => request.action === 'blocked-unexpected-request'), 'no unexpected external or non-read product requests');
     assert.ok(!responses.some(response => response.error), 'browser-observed resource bodies and MIME match');
@@ -462,16 +477,36 @@ async function runScenario(browser, engine, scenario, fixture, deployment) {
     result.status = 'passed';
   } catch (error) {
     result.status = 'failed'; result.error = error.stack;
-    await page.screenshot({ path: path.join(directory, 'failure-diagnostic.png'), fullPage: true }).catch(() => {});
+    await withDeadline(page.screenshot({ path: path.join(directory, 'failure-diagnostic.png'),
+      fullPage: true, timeout: 5000 }), 'Failure diagnostic screenshot', 6000)
+      .catch(error => { result.diagnosticScreenshotError = String(error); });
   } finally {
     deployment.server?.missing.clear();
-    await Promise.all(pending);
-    Object.assign(result, { network, errors, logs, workers, responses,
-      downloads: downloads.map(download => download.suggestedFilename()),
-      serverRequests: deployment.server?.ledger.slice(ledgerStart) || [] });
-    await writeJson(path.join(directory, 'result.json'), result);
-    await context.close();
+    // Persist diagnostics before cleanup, including observers that have not yet
+    // settled. No failed-load worker evaluation is outstanding at this boundary.
+    const persist = async () => {
+      Object.assign(result, { network, errors, logs, workers, responses,
+        downloads: downloads.map(download => download.suggestedFilename()),
+        serverRequests: deployment.server?.ledger.slice(ledgerStart) || [] });
+      await writeJson(path.join(directory, 'result.json'), result);
+    };
+    try { await persist(); }
+    finally {
+      try {
+        await withDeadline(context.close(), 'Browser context cleanup');
+        result.cleanup = { status: 'closed' };
+      } catch (error) {
+        result.status = 'failed'; result.cleanup = { status: 'failed', error: String(error) };
+      }
+    }
+    // Closing the context can settle unavailable response bodies. Their own
+    // deadlines keep this diagnostic drain bounded even if the browser does not.
+    try { await withDeadline(Promise.all(pending), 'Supplemental response cleanup', 11000); }
+    catch (error) { result.observerCleanupError = String(error); result.status = 'failed'; }
+    await persist();
+    workerHandles.clear();
   }
+
   return result;
 }
 
