@@ -1,26 +1,36 @@
-# Hosted Chromium acceptance
+# Hosted production and development acceptance
 
-This package keeps Playwright outside the application's dependency manifest and lockfile. Node 24.19.0 and npm 11.9.0 are the validated runtime. Playwright 1.64.0 is pinned exactly, along with its transitive dependency and registry integrity in this package's lockfile. The workflow audits this package separately and fails for any reported vulnerability.
+Playwright stays outside the application's dependency manifest and lockfile. The existing isolated package pins Playwright 1.64.0; both application and tooling locks remain unchanged. The workflow uses Node 24.19.0 and npm 11.9.0, audits the isolated tooling with an enforced zero-findings gate, and preserves its JSON report and actual exit code.
 
-The acceptance script is intended for a hosted GitHub Actions runner. It refuses to start outside Actions. It starts Vite on the runner's loopback interface, opens the actual app in Chromium, uploads only the included synthetic PDF fixtures, and receives genuine browser DOCX downloads. The fixed PDF.js CDN worker request is fulfilled from the installed, matching pdfjs-dist 3.11.174 worker. Any other external request, or any non-read request, is blocked and fails acceptance. Real dedicated PDF.js workers are required; fake-worker fallback fails acceptance.
+The script requires both genuine GitHub Actions and a GitHub-hosted runner. Do not spoof those flags or launch this suite locally. It installs and runs the Chromium, Firefox and WebKit engines belonging to the pinned Playwright release. These current hosted engines do not establish support for Safari, iOS or older browser versions. A configured engine is accepted only when its results are present and pass in the artifact.
 
-## Coverage
+## Served production worker
 
-- Healthy three-page scanned and text/vector PDFs, each with distinct red, green, and blue page markers
-- Page 2 returning a null canvas context, an empty `data:,` export, malformed base64 that fails decoding, or an image-encoding exception
-- For every fault: a page-specific error, no download, no success message, no 100% status, and no attempt to process page 3
-- Retry on the same page with the same selected file after each fault, producing a complete DOCX
-- Actual DOCX ZIP structure, exactly three media files, exact byte equality with all real source-page JPEGs in source order, page labels, title/date, and the existing image dimensions
+The suite runs the normal `npm run build` script separately for `/` and `/pdf-word/`, including normal minification and the application's `esbuild.keepNames` setting. A loopback HTTP server serves those actual build files. The emitted classic `pdf.worker.min-*.js` asset must be byte-identical to the installed `pdfjs-dist/build/pdf.worker.min.js` from version 3.11.174. Every served worker response records its real body, SHA-256, size and JavaScript MIME type. The committed, emitted and genuinely served `pdfjs-LICENSE.txt` must also match the installed upstream license byte-for-byte at both bases. There is no intercepted worker fulfillment, CDN substitution or replacement renderer.
 
-Faults are limited to the browser canvas boundary on source page 2. PDF.js rendering, React, DOCX construction/packing, FileSaver, and downloads are not replaced. Source JPEG pixels also verify the expected page-color order. The independent core suite covers additional render/load/insert/pack/save exceptions and the complete progress-state sequence.
+The browser's native Worker constructor is observed without replacing its implementation. Every accepted conversion must construct a same-origin classic worker, receive PDF.js's successful native transferable-data handshake, and execute in a dedicated worker scope without a document. The worker URL must preserve the configured deployment base. Fake-worker fallback is forbidden on healthy conversions, repeated conversions, canvas-fault retries and recovery after reload. External HTTP requests and all non-read HTTP requests are blocked and fail acceptance. Only development Vite's same-origin websocket is permitted.
+
+## Conversion coverage
+
+Each of the three engines runs 7 scenarios on each production base and 6 scenarios against the actual Vite development server: 60 scenario results in total.
+
+- Both original three-page scanned and text/vector PDF fixtures convert successfully and then repeat with the same selected file on the same page
+- Page 2 returns a null canvas context, an empty `data:,` export, malformed base64, or an encoding exception
+- Each canvas fault produces a page-specific error, no download, no success message, no 100% status and no processing of page 3; restoring the canvas boundary then retries on the same page with the same selected file
+- Production worker absence is a real HTTP 404 at the emitted worker URL, including fallback requests; no partial download or false completion is allowed
+- After restoring the worker resource, the suite deliberately probes the same page and records its actual result. PDF.js 3.11 may retain disabled-worker state and a rejected fake-worker setup promise. A subsequent reload and selection of the identical fixture must recover with a genuine dedicated worker. Reload recovery is explicitly recorded and is never described as in-place recovery
+- Every accepted DOCX has exactly three ordered media images with exact byte equality to each real rendered source-page JPEG, page labels, source title, creation date, the existing 600px image width and 2:1 source aspect ratio
+- Rendered source pixels establish red/green/blue page order and visible interior text/content, so a solid-color blank render cannot satisfy the content check
+
+Faults remain at the browser canvas boundary. Immediate caller detection finds the named observation wrapper in the engine's actual stack and examines only the next frame; it does not assume Chromium's stack line count. The ordinary production `keepNames` setting preserves the converter name. Each fault records exact context/export invocation counts and source page 2. A missing caller match fails the hosted assertions rather than silently omitting the fault. PDF.js, React, DOCX packing, FileSaver and downloads remain real.
 
 ## Review evidence
 
-The Actions artifact contains conversion screenshots, visible page text, each actual downloaded DOCX, each rendered source-page JPEG, DOCX/media hashes, browser logs, and the browser-tool audit report. `summary.json` records the actual checked-out commit and Git tree, event SHA, run ID/attempt, browser/runtime versions, both lockfile hashes, and source-fixture hashes. `manifest.json` binds each evidence file to its SHA-256 and that commit/tree.
+Artifacts include actual builds, served worker bytes, each downloaded DOCX, rendered source JPEGs, screenshots, visible page text, exact page/caller observations, native worker evidence, network/server ledgers and hashes. `summary.json` records the checked-out commit/tree, workflow SHA and run/attempt, browser/runtime versions, package and lockfile hashes, fixture hashes, deployment bases and every result. `manifest.json` binds each evidence file to that commit/tree and SHA-256. Browser response bodies are cross-checked when exposed by the engine; the real-origin response ledger and captured worker body are always required for production.
 
-Review the screenshots and render the downloaded DOCX files in a document viewer after downloading the artifact. The scripted ZIP/media checks do not claim that Word or LibreOffice layout has been visually accepted. Conversion acceptance is complete only after that separate visual review.
+Review screenshots and render downloaded DOCX files in a document viewer after downloading the artifact. ZIP/media assertions do not replace visual acceptance of Word or LibreOffice layout. A script that is merely configured, syntax-checked or built has not passed hosted browser acceptance.
 
-The PDF fixtures contain no user documents. Each is three pages at 480 × 240 points; the scanned version contains raster text markers and the vector version contains text and shapes. Both have page colors (220, 50, 50), (40, 150, 60), and (45, 85, 210), in that order. Their SHA-256 values are:
+The synthetic PDF fixtures contain no user documents. Each has three 480 × 240 point pages and the red, green and blue page colors (220, 50, 50), (40, 150, 60) and (45, 85, 210). Their unchanged hashes are:
 
 - `scanned-three-pages.pdf`: `3271e2e9dd398e37a12dbfd0d917f850a8d5c7fc59ab9a9c49f7f7e40f2b8661`
 - `vector-three-pages.pdf`: `9fab680ced24e8b13a6ac2243c745238be0cfdda33ec0ccf86f47e1c2451d264`
