@@ -10,7 +10,7 @@ const JSZip = createRequire(require.resolve('docx'))('jszip');
 
 // Execute the actual component handler, with adapters for React state, PDF.js,
 // canvas and downloads. DOCX construction, packing and ZIP/media checks are real.
-// Browser rendering and the external PDF.js worker need separate acceptance QA.
+// Browser rendering and the same-origin PDF.js worker need separate acceptance QA.
 const componentPath = path.join(__dirname, '../src/components/PdfToWordConverter.tsx');
 const compiled = ts.transpileModule(fs.readFileSync(componentPath, 'utf8'), {
   compilerOptions: {
@@ -89,6 +89,7 @@ function createHarness(initialFailure, failurePage = 2) {
     require(name) {
       if (name === 'react') return react;
       if (name === 'pdfjs-dist') return pdfjs;
+      if (name === 'pdfjs-dist/build/pdf.worker.min.js?url') return '/assets/pdf.worker.min.js';
       if (name === 'file-saver') return { saveAs(blob, filename) {
         if (failure === 'save') throw new Error('download failed');
         downloads.push({ blob, filename });

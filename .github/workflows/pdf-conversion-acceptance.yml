@@ -16,7 +16,7 @@ jobs:
   conversion:
     if: github.repository == 'tang-vu/pdf-word'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       EXPECTED_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
@@ -37,16 +37,22 @@ jobs:
       - name: Audit isolated browser tooling
         run: |
           mkdir -p tests/browser/artifacts
+          set +e
           npm audit --prefix tests/browser --audit-level=low --json > tests/browser/artifacts/browser-tool-audit.json
+          audit_status=$?
+          printf '%s\n' "$audit_status" > tests/browser/artifacts/browser-tool-audit.exit-code
+          exit "$audit_status"
+      - name: Browser observation orchestration tests
+        run: node --test tests/browser/observation.test.cjs tests/browser/canvas-boundary.test.cjs
       - name: Core conversion tests
         run: npm test
       - name: Lint
         run: npm run lint
       - name: Build
         run: npm run build
-      - name: Install official Chromium
-        run: node tests/browser/node_modules/playwright/cli.js install --with-deps chromium
-      - name: Accept real browser conversions and downloads
+      - name: Install official hosted browser engines
+        run: node tests/browser/node_modules/playwright/cli.js install --with-deps chromium firefox webkit
+      - name: Accept production and development conversions
         run: npm run acceptance --prefix tests/browser
       - name: Preserve browser and DOCX evidence
         if: always()

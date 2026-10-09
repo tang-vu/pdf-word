@@ -9,13 +9,13 @@
 - Tạo tệp Word (.docx) chứa tất cả các hình ảnh với định dạng đẹp
 - Theo dõi tiến trình chuyển đổi với thanh tiến độ
 - Hiển thị nhật ký chi tiết trong quá trình chuyển đổi
-- Xử lý hoàn toàn trong trình duyệt, không cần kết nối internet (ngoại trừ lúc tải worker PDF.js)
+- Xử lý PDF hoàn toàn trong trình duyệt; worker PDF.js được tải từ cùng máy chủ với ứng dụng, không qua CDN
 
 ## Cài Đặt
 
 1. Clone repository:
 ```
-git clone https://github.com/yourusername/pdf-word.git
+git clone https://github.com/tang-vu/pdf-word.git
 cd pdf-word
 ```
 
@@ -48,7 +48,9 @@ Nếu bất kỳ trang nào không thể chuyển đổi, ứng dụng hiển th
 
 ## Bảo Mật
 
-Ứng dụng đặt `isEvalSupported: false` theo biện pháp giảm thiểu được Mozilla công bố trong [GHSA-wgrm-67xf-hhpq](https://github.com/mozilla/pdf.js/security/advisories/GHSA-wgrm-67xf-hhpq). Đây là thay đổi cấu hình; dự án vẫn dùng PDF.js 3.11 và các cảnh báo kiểm toán dependency vẫn còn. Việc nâng cấp PDF.js và chuyển sang ESM/module worker được dành cho một thay đổi riêng.
+Ứng dụng đặt `isEvalSupported: false` theo biện pháp giảm thiểu được Mozilla công bố trong [GHSA-wgrm-67xf-hhpq](https://github.com/mozilla/pdf.js/security/advisories/GHSA-wgrm-67xf-hhpq). Đây là thay đổi cấu hình; dự án vẫn dùng PDF.js 3.11 và các cảnh báo kiểm toán dependency vẫn còn. Việc nâng cấp PDF.js được dành cho một thay đổi riêng. Worker classic được Vite đóng gói từ đúng package PDF.js đã cài, cùng origin với ứng dụng. Giấy phép upstream được giữ nguyên tại `public/pdfjs-LICENSE.txt` và được Vite sao chép vào `dist/pdfjs-LICENSE.txt`; header giấy phép trong worker cũng được giữ nguyên.
+
+Với đường dẫn triển khai lồng nhau, dùng ví dụ `npm run build -- --base=/pdf-word/` và phục vụ toàn bộ thư mục `dist`, bao gồm worker. Vite tạo URL worker theo `base`. Trình duyệt vẫn cần kết nối tới máy chủ để tải ứng dụng và worker; dự án không cung cấp service worker hay cam kết hoạt động offline.
 
 ## Công Nghệ Sử Dụng
 

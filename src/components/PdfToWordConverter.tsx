@@ -2,9 +2,10 @@ import React, { useState } from 'react';
 import * as docx from 'docx';
 import { saveAs } from 'file-saver';
 import * as pdfjsLib from 'pdfjs-dist';
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.js?url';
 
-// Khởi tạo PDF.js worker - cập nhật phiên bản để khớp với thư viện
-pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+// Vite đóng gói worker từ đúng phiên bản PDF.js đã cài, cùng origin với ứng dụng.
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const PdfToWordConverter: React.FC = () => {
   const [pdfFile, setPdfFile] = useState<File | null>(null);
