@@ -34,6 +34,22 @@ npm run dev
 npm run build
 ```
 
+## Kiểm Tra
+
+```
+npm test
+npm run lint
+npm run build
+```
+
+Các kiểm thử dùng trình chạy tích hợp của Node.js, TypeScript và các thư viện hiện có, không cần cài thêm thư viện kiểm thử. Kiểm thử thực thi hàm chuyển đổi của component với bộ mô phỏng React state, PDF.js, canvas và thao tác tải xuống; tệp DOCX được đóng gói thật và kiểm tra dữ liệu ảnh, thứ tự trang, bố cục, các lỗi giữa chừng và thao tác thử lại. Việc hiển thị PDF và tải worker trong trình duyệt cần được kiểm tra riêng.
+
+Nếu bất kỳ trang nào không thể chuyển đổi, ứng dụng hiển thị số trang gặp lỗi và không tạo hoặc tải xuống tệp Word thiếu trang. Chỉ báo 100% khi tệp DOCX hoàn chỉnh đã được tạo và bắt đầu tải xuống.
+
+## Bảo Mật
+
+Ứng dụng đặt `isEvalSupported: false` theo biện pháp giảm thiểu được Mozilla công bố trong [GHSA-wgrm-67xf-hhpq](https://github.com/mozilla/pdf.js/security/advisories/GHSA-wgrm-67xf-hhpq). Đây là thay đổi cấu hình; dự án vẫn dùng PDF.js 3.11 và các cảnh báo kiểm toán dependency vẫn còn. Việc nâng cấp PDF.js và chuyển sang ESM/module worker được dành cho một thay đổi riêng.
+
 ## Công Nghệ Sử Dụng
 
 - React

@@ -6,14 +6,6 @@ import * as pdfjsLib from 'pdfjs-dist';
 // Khởi tạo PDF.js worker - cập nhật phiên bản để khớp với thư viện
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-// Định nghĩa interface cho Document để TypeScript hiểu đúng kiểu dữ liệu
-interface DocxDocumentInterface {
-  sections: Array<{
-    properties: any;
-    children: any[];
-  }>;
-}
-
 const PdfToWordConverter: React.FC = () => {
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [isConverting, setIsConverting] = useState<boolean>(false);
@@ -45,6 +37,7 @@ const PdfToWordConverter: React.FC = () => {
     try {
       setIsConverting(true);
       setProgress(0);
+      setError('');
       setLog([]);
       addLog('Bắt đầu quá trình chuyển đổi...');
 
@@ -53,7 +46,7 @@ const PdfToWordConverter: React.FC = () => {
       addLog('Đang tải tệp PDF...');
       
       // Tải PDF document
-      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer, isEvalSupported: false }).promise;
       const numPages = pdf.numPages;
       addLog(`PDF có ${numPages} trang. Đang xử lý...`);
       
@@ -89,35 +82,51 @@ const PdfToWordConverter: React.FC = () => {
         })
       );
       
-      // Xử lý từng trang của PDF
+      // Xử lý từng trang; chỉ tạo tệp Word khi tất cả các trang thành công.
       for (let i = 1; i <= numPages; i++) {
         addLog(`Đang xử lý trang ${i}/${numPages}...`);
-        setProgress(Math.floor((i / numPages) * 100));
-        
-        // Lấy trang
-        const page = await pdf.getPage(i);
-        
-        // Cài đặt tỷ lệ để render
-        const scale = 1.5;
-        const viewport = page.getViewport({ scale });
-        
-        // Tạo canvas để render trang PDF
-        const canvas = document.createElement('canvas');
-        const context = canvas.getContext('2d');
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-        
-        if (context) {
-          // Render trang PDF vào canvas
+
+        try {
+          const page = await pdf.getPage(i);
+          const viewport = page.getViewport({ scale: 1.5 });
+          const canvas = document.createElement('canvas');
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          const context = canvas.getContext('2d');
+
+          if (!context) {
+            throw new Error('Không thể tạo vùng vẽ cho trang PDF.');
+          }
+
           await page.render({
             canvasContext: context,
-            viewport: viewport
+            viewport: viewport,
           }).promise;
-          
-          // Chuyển đổi canvas thành dạng base64
+
           const imgData = canvas.toDataURL('image/jpeg', 0.95);
-          
-          // Thêm tiêu đề trang
+          const imageData = imgData.split(',')[1];
+          if (!imgData.startsWith('data:image/') || !imageData) {
+            throw new Error('Không thể trích xuất dữ liệu hình ảnh.');
+          }
+
+          const imageBytes = Uint8Array.from(atob(imageData), c => c.charCodeAt(0));
+          if (imageBytes.length === 0) {
+            throw new Error('Dữ liệu hình ảnh trống.');
+          }
+
+          const imageParagraph = new docx.Paragraph({
+            children: [
+              new docx.ImageRun({
+                data: imageBytes,
+                transformation: {
+                  width: 600,
+                  height: Math.floor(600 * (viewport.height / viewport.width)),
+                },
+              }),
+            ],
+            alignment: docx.AlignmentType.CENTER,
+          });
+
           paragraphs.push(
             new docx.Paragraph({
               children: [
@@ -132,39 +141,8 @@ const PdfToWordConverter: React.FC = () => {
                 after: 200,
               },
               alignment: docx.AlignmentType.CENTER,
-            })
-          );
-          
-          // Tạo đối tượng hình ảnh từ base64
-          const imageData = imgData.split(',')[1];
-          
-          if (!imageData) {
-            addLog(`Cảnh báo: Không thể trích xuất dữ liệu hình ảnh cho trang ${i}`);
-            continue;
-          }
-          
-          // Thêm hình ảnh vào document
-          try {
-            const imagePararaph = new docx.Paragraph({
-              children: [
-                new docx.ImageRun({
-                  data: Uint8Array.from(atob(imageData), c => c.charCodeAt(0)),
-                  transformation: {
-                    width: 600,
-                    height: Math.floor(600 * (viewport.height / viewport.width)),
-                  },
-                }),
-              ],
-              alignment: docx.AlignmentType.CENTER,
-            });
-            
-            paragraphs.push(imagePararaph);
-          } catch (imageError) {
-            addLog(`Cảnh báo: Không thể thêm hình ảnh cho trang ${i}: ${imageError instanceof Error ? imageError.message : 'Lỗi không xác định'}`);
-          }
-          
-          // Thêm khoảng trống giữa các trang
-          paragraphs.push(
+            }),
+            imageParagraph,
             new docx.Paragraph({
               text: '',
               spacing: {
@@ -172,9 +150,14 @@ const PdfToWordConverter: React.FC = () => {
               },
             })
           );
+
+          // Chỉ báo 100% sau khi đã tạo và tải tệp DOCX hoàn chỉnh.
+          setProgress(Math.min(99, Math.floor((i / numPages) * 100)));
+        } catch (pageError) {
+          throw new Error(`Không thể chuyển đổi trang ${i}: ${pageError instanceof Error ? pageError.message : 'Lỗi không xác định'}`);
         }
       }
-      
+
       // Tạo document Word mới với tất cả các đoạn văn bản đã tạo
       const doc = new docx.Document({
         sections: [
@@ -197,13 +180,13 @@ const PdfToWordConverter: React.FC = () => {
       saveAs(blob, wordFileName);
       
       addLog('Chuyển đổi hoàn tất! Tệp DOCX đã được tải về.');
-      setIsConverting(false);
       setProgress(100);
       
     } catch (err) {
       console.error('Lỗi khi chuyển đổi:', err);
       setError(`Lỗi khi chuyển đổi: ${err instanceof Error ? err.message : 'Lỗi không xác định'}`);
       addLog(`Đã xảy ra lỗi: ${err instanceof Error ? err.message : 'Lỗi không xác định'}`);
+    } finally {
       setIsConverting(false);
     }
   };
@@ -232,7 +215,7 @@ const PdfToWordConverter: React.FC = () => {
         )}
         
         {error && (
-          <div className="mb-4 p-3 bg-red-100 text-red-700 rounded-md">
+          <div role="alert" className="mb-4 p-3 bg-red-100 text-red-700 rounded-md">
             {error}
           </div>
         )}
